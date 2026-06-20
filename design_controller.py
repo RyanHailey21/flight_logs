@@ -63,6 +63,14 @@ def simulate_closed_loop(a, b, nk, Ts, Kp, Ki, Kd, sign_gain, N_steps=150):
 def design_controller():
     folder = Path(".")
     out = folder / "out"
+    models_dir = out / "models"
+    plots_dir = out / "plots"
+    reports_dir = out / "reports"
+    
+    models_dir.mkdir(exist_ok=True)
+    plots_dir.mkdir(exist_ok=True)
+    reports_dir.mkdir(exist_ok=True)
+    
     Ts = get_sampling_time(folder)
     print(f"Sampling time: {Ts:.6f} s ({1/Ts:.1f} Hz)")
     
@@ -83,7 +91,7 @@ def design_controller():
     controller_report.append("# Model-Based Controller Design and Tuning Report\n")
     
     for axis in [0, 1, 2]:
-        model_path = out / f"arx_model_axis{axis}.pkl"
+        model_path = models_dir / f"arx_model_axis{axis}.pkl"
         if not model_path.exists():
             continue
             
@@ -177,7 +185,7 @@ def design_controller():
         ax2.legend()
         
         plt.tight_layout()
-        plot_path = out / f"control_design_axis{axis}.png"
+        plot_path = plots_dir / f"control_design_axis{axis}.png"
         plt.savefig(plot_path)
         plt.close()
         
@@ -201,7 +209,7 @@ def design_controller():
         controller_report.append(report_section)
         
     # Write report
-    report_file = out / "control_design_report.md"
+    report_file = reports_dir / "control_design_report.md"
     with open(report_file, "w") as f:
         f.writelines(controller_report)
     print(f"\nSaved control design report to {report_file}")

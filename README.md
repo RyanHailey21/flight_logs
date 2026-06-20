@@ -9,14 +9,14 @@ This repository contains a Python-based system identification and model-based co
 - `id_pipeline.py`: Runs ARX (Autoregressive with Exogenous Input) system identification on flight logs.
 - `analyze_models.py`: Analyzes the identified discrete-time models (poles, zeros, stability, DC gain, and Bode plots).
 - `design_controller.py`: Designs and simulates discrete-time PID controllers by optimizing tracking error (ITAE) and control effort.
-- `run_pipeline.py`: Master automation script that executes identification, analysis, and control design sequentially in one command.
+- `run_pipeline.py`: Master automation script that executes identification, analysis, control design, and manifest compilation in one command.
 - `raw_logs/`: Directory containing raw `.BBL` binary log files.
-- `out/`: Contains the generated outputs:
-  - `arx_model_axis{0,1,2}.pkl`: Saved model coefficients.
-  - `fit_axis{0,1,2}.png`: Time-domain predictions vs. true gyro rate.
-  - `pzmap_axis{0,1,2}.png` & `bode_axis{0,1,2}.png`: Frequency-domain and pole-zero analysis.
-  - `control_design_axis{0,1,2}.png`: Closed-loop step response simulations.
-  - `model_analysis_report.md` & `control_design_report.md`: Structured markdown reports.
+- `out/`: Contains the structured generated outputs:
+  - `csv/`: Decoded CSV telemetry logs (e.g., `btfl_all.24.csv`) and headers.
+  - `models/`: Saved model coefficient pickles (`arx_model_axis{0,1,2}.pkl`).
+  - `plots/`: Plant fit plots, Bode diagrams, pole-zero maps, and step responses.
+  - `reports/`: Markdown analysis and controller tuning reports.
+  - `log_manifest.csv` & `log_manifest.json`: Auto-generated indexes of all CSV logs with duration, samples, max throttle, gyro variance, and flight/bench classification.
 
 ---
 
@@ -85,6 +85,6 @@ To ensure that the identified models and designed controllers represent physical
 If you have new `.BBL` binary log files in the future, you can export them to CSVs using the globally installed `bbl_parser` CLI tool:
 
 ```powershell
-bbl_parser --csv --output-dir out/ raw_logs/
+bbl_parser --csv --output-dir out/csv/ raw_logs/
 ```
 

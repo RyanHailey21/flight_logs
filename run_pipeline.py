@@ -18,6 +18,11 @@ def main():
     args = ap.parse_args()
 
     python_bin = sys.executable
+
+    # Ensure output directory structure exists
+    out = Path("out")
+    for sub in ["csv", "models", "plots", "reports"]:
+        (out / sub).mkdir(parents=True, exist_ok=True)
     
     print("=================================================================")
     print("   Multirotor System ID and Control Design Master Pipeline       ")
@@ -57,15 +62,25 @@ def main():
     except subprocess.CalledProcessError as e:
         print(f"[Error] Error during Controller Design: {e}")
         sys.exit(1)
+
+    # Step 4: Log Manifest Generation
+    print("--- STEP 4: Compiling Log Manifest ---")
+    try:
+        subprocess.run([python_bin, "id_pipeline.py", "--compile-manifest"], check=True)
+        print("  Log Manifest Generation Complete.\n")
+    except subprocess.CalledProcessError as e:
+        print(f"[Error] Error during Log Manifest Generation: {e}")
+        sys.exit(1)
         
     print("=================================================================")
     print("   Pipeline Execution Complete!                                  ")
     print("   Outputs generated in the 'out/' directory:                    ")
-    print("     - ARX Fit Plots: fit_axis{0,1,2}.png                        ")
-    print("     - Pole-Zero Maps: pzmap_axis{0,1,2}.png                     ")
-    print("     - Bode Plots: bode_axis{0,1,2}.png                          ")
-    print("     - Control Design Plots: control_design_axis{0,1,2}.png      ")
-    print("     - Reports: model_analysis_report.md, control_design_report.md")
+    print("     - ARX Fit Plots: out/plots/fit_axis{0,1,2}.png              ")
+    print("     - Pole-Zero Maps: out/plots/pzmap_axis{0,1,2}.png           ")
+    print("     - Bode Plots: out/plots/bode_axis{0,1,2}.png                ")
+    print("     - Control Design Plots: out/plots/control_design_axis{0,1,2}.png")
+    print("     - Reports: out/reports/model_analysis_report.md, out/reports/control_design_report.md")
+    print("     - Log Manifests: out/log_manifest.json, out/log_manifest.csv")
     print("=================================================================")
 
 if __name__ == "__main__":

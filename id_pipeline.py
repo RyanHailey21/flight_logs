@@ -20,19 +20,23 @@ from scipy.optimize import lsq_linear
 
 def load_logs(folder: Path, file_name: str = None):
     dfs = []
+    csv_dir = folder / "out" / "csv"
+    if not csv_dir.exists():
+        csv_dir = folder / "csv"
+    if not csv_dir.exists():
+        csv_dir = folder
+
     if file_name:
         p = Path(file_name)
+        if not p.exists():
+            p = csv_dir / file_name
         if not p.exists():
             p = folder / file_name
         if not p.exists():
             p = folder / "out" / file_name
         paths = [p] if p.exists() else []
     else:
-        csvs = sorted(folder.glob("*.csv"))
-        if not csvs:
-            out_folder = folder / "out"
-            if out_folder.exists():
-                csvs = sorted(out_folder.glob("*.csv"))
+        csvs = sorted(csv_dir.glob("*.csv"))
         paths = [p for p in csvs if "headers.csv" not in p.name and p.name != "combined.csv"]
 
     for p in paths:
@@ -52,12 +56,13 @@ def load_logs(folder: Path, file_name: str = None):
 
 def get_sampling_time(folder: Path, verbose: bool = True):
     """Estimate average sampling time Ts in seconds from CSV logs."""
-    csvs = sorted(folder.glob("*.csv"))
-    if not csvs:
-        out_folder = folder / "out"
-        if out_folder.exists():
-            csvs = sorted(out_folder.glob("*.csv"))
-    
+    csv_dir = folder / "out" / "csv"
+    if not csv_dir.exists():
+        csv_dir = folder / "csv"
+    if not csv_dir.exists():
+        csv_dir = folder
+        
+    csvs = sorted(csv_dir.glob("*.csv"))
     csvs = [p for p in csvs if "headers.csv" not in p.name and p.name != "combined.csv"]
     
     for p in csvs:
@@ -149,6 +154,83 @@ class ConstrainedModel:
 
 
 
+def compile_manifest(folder: Path):
+    """Scan the csv subfolder and compile metadata about all flight logs."""
+    csv_dir = folder / "out" / "csv"
+    if not csv_dir.exists():
+        csv_dir = folder / "csv"
+    if not csv_dir.exists():
+        print("No CSV directory found to compile manifest from.")
+        return
+        
+    csvs = sorted(csv_dir.glob("*.csv"))
+    csvs = [p for p in csvs if "headers.csv" not in p.name and p.name != "combined.csv"]
+    
+    records = []
+    print(f"Compiling manifest for {len(csvs)} logs...")
+    
+    for p in csvs:
+        try:
+            df = pd.read_csv(p)
+            df.columns = [c.strip() for c in df.columns]
+            
+            rows = len(df)
+            duration = 0.0
+            if "time (us)" in df.columns:
+                t_vals = pd.to_numeric(df["time (us)"], errors='coerce').dropna().values
+                if len(t_vals) > 1:
+                    duration = (t_vals[-1] - t_vals[0]) * 1e-6
+            elif "time" in df.columns:
+                t_vals = pd.to_numeric(df["time"], errors='coerce').dropna().values
+                if len(t_vals) > 1:
+                    duration = t_vals[-1] - t_vals[0]
+                    
+            max_th = 0.0
+            if "rcCommand[3]" in df.columns:
+                max_th = float(pd.to_numeric(df["rcCommand[3]"], errors='coerce').max())
+            elif "rcCommand" in df.columns:
+                max_th = float(pd.to_numeric(df["rcCommand"], errors='coerce').max())
+                
+            gyro_std = [0.0, 0.0, 0.0]
+            for axis in [0, 1, 2]:
+                col = f"gyroADC[{axis}]"
+                if col in df.columns:
+                    gyro_std[axis] = float(pd.to_numeric(df[col], errors='coerce').std())
+                    
+            is_active = (max_th > 1180) and (max(gyro_std[0], gyro_std[1]) > 5.0)
+            flight_type = "Active Flight" if is_active else "Bench Test"
+            
+            records.append({
+                "filename": p.name,
+                "samples": rows,
+                "duration_sec": round(duration, 2),
+                "max_throttle": round(max_th, 1),
+                "gyro_std_roll": round(gyro_std[0], 2),
+                "gyro_std_pitch": round(gyro_std[1], 2),
+                "gyro_std_yaw": round(gyro_std[2], 2),
+                "flight_type": flight_type
+            })
+        except Exception as e:
+            print(f"Error scanning {p.name}: {e}")
+            
+    if not records:
+        print("No valid CSV logs parsed for manifest.")
+        return
+        
+    manifest_df = pd.DataFrame(records)
+    
+    out_dir = folder / "out"
+    out_dir.mkdir(exist_ok=True)
+    
+    csv_path = out_dir / "log_manifest.csv"
+    json_path = out_dir / "log_manifest.json"
+    
+    manifest_df.to_csv(csv_path, index=False)
+    manifest_df.to_json(json_path, orient="records", indent=2)
+    
+    print(f"Saved manifest to {csv_path} and {json_path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--folder", default=".", help="Folder with .csv logs")
@@ -157,11 +239,16 @@ def main():
     ap.add_argument("--na", type=int, default=4, help="Output lag order")
     ap.add_argument("--nb", type=int, default=4, help="Input lag order")
     ap.add_argument("--nk", type=int, default=2, help="Input pure delay (latency frames)")
+    ap.add_argument("--compile-manifest", action="store_true", help="Compile manifest of all CSV logs")
     args = ap.parse_args()
 
     folder = Path(args.folder)
     out = Path(folder) / "out"
     out.mkdir(exist_ok=True)
+
+    if args.compile_manifest:
+        compile_manifest(folder)
+        return
 
     dfs = load_logs(folder, args.file)
     
@@ -192,7 +279,9 @@ def main():
     print("Model coefficients (a_1..a_na, b_1..b_nb):", model.coef_)
     
     # Save model
-    model_path = out / f"arx_model_axis{args.axis}.pkl"
+    models_dir = out / "models"
+    models_dir.mkdir(exist_ok=True)
+    model_path = models_dir / f"arx_model_axis{args.axis}.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({
             "model": model, 
@@ -225,7 +314,9 @@ def main():
     plt.ylabel("Gyro Rate")
     plt.tight_layout()
     
-    figpath = out / f"fit_axis{args.axis}.png"
+    plots_dir = out / "plots"
+    plots_dir.mkdir(exist_ok=True)
+    figpath = plots_dir / f"fit_axis{args.axis}.png"
     plt.savefig(figpath)
     print(f"Saved fit plot to {figpath}")
 

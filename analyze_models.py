@@ -9,6 +9,14 @@ from id_pipeline import ConstrainedModel, get_sampling_time
 def main():
     folder = Path(".")
     out = folder / "out"
+    models_dir = out / "models"
+    plots_dir = out / "plots"
+    reports_dir = out / "reports"
+    
+    models_dir.mkdir(exist_ok=True)
+    plots_dir.mkdir(exist_ok=True)
+    reports_dir.mkdir(exist_ok=True)
+    
     Ts = get_sampling_time(folder)
     
     axes_names = {0: "Roll", 1: "Pitch", 2: "Yaw"}
@@ -17,7 +25,7 @@ def main():
     analysis_report.append("# System Identification Model Analysis Report\n")
     
     for axis in [0, 1, 2]:
-        model_path = out / f"arx_model_axis{axis}.pkl"
+        model_path = models_dir / f"arx_model_axis{axis}.pkl"
         if not model_path.exists():
             print(f"Model for axis {axis} not found at {model_path}, skipping.")
             continue
@@ -114,7 +122,7 @@ def main():
         plt.xlim([-1.5, 1.5])
         plt.ylim([-1.5, 1.5])
         plt.tight_layout()
-        pz_path = out / f"pzmap_axis{axis}.png"
+        pz_path = plots_dir / f"pzmap_axis{axis}.png"
         plt.savefig(pz_path)
         plt.close()
         
@@ -148,7 +156,7 @@ def main():
         ax2.grid(True, which='both', linestyle=':', alpha=0.5)
         
         plt.tight_layout()
-        bode_path = out / f"bode_axis{axis}.png"
+        bode_path = plots_dir / f"bode_axis{axis}.png"
         plt.savefig(bode_path)
         plt.close()
         
@@ -156,7 +164,7 @@ def main():
         print(f"  Saved Bode Plot to {bode_path}")
 
     # Write report
-    report_file = out / "model_analysis_report.md"
+    report_file = reports_dir / "model_analysis_report.md"
     with open(report_file, "w") as f:
         f.writelines(analysis_report)
     print(f"\nSaved analysis report to {report_file}")
