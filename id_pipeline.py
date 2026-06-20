@@ -18,18 +18,24 @@ import pandas as pd
 from scipy.optimize import lsq_linear
 
 
-def load_logs(folder: Path):
+def load_logs(folder: Path, file_name: str = None):
     dfs = []
-    csvs = sorted(folder.glob("*.csv"))
-    if not csvs:
-        out_folder = folder / "out"
-        if out_folder.exists():
-            csvs = sorted(out_folder.glob("*.csv"))
+    if file_name:
+        p = Path(file_name)
+        if not p.exists():
+            p = folder / file_name
+        if not p.exists():
+            p = folder / "out" / file_name
+        paths = [p] if p.exists() else []
+    else:
+        csvs = sorted(folder.glob("*.csv"))
+        if not csvs:
+            out_folder = folder / "out"
+            if out_folder.exists():
+                csvs = sorted(out_folder.glob("*.csv"))
+        paths = [p for p in csvs if "headers.csv" not in p.name and p.name != "combined.csv"]
 
-    # filter out headers.csv
-    csvs = [p for p in csvs if "headers.csv" not in p.name and p.name != "combined.csv"]
-
-    for p in csvs:
+    for p in paths:
         try:
             df = pd.read_csv(p, low_memory=False)
             df.columns = [c.strip() for c in df.columns] # Clean column names
@@ -146,6 +152,7 @@ class ConstrainedModel:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--folder", default=".", help="Folder with .csv logs")
+    ap.add_argument("--file", default=None, help="Specific CSV file to load")
     ap.add_argument("--axis", type=int, default=0, help="0=Roll, 1=Pitch, 2=Yaw")
     ap.add_argument("--na", type=int, default=4, help="Output lag order")
     ap.add_argument("--nb", type=int, default=4, help="Input lag order")
@@ -156,7 +163,7 @@ def main():
     out = Path(folder) / "out"
     out.mkdir(exist_ok=True)
 
-    dfs = load_logs(folder)
+    dfs = load_logs(folder, args.file)
     
     print(f"Building regressors for Axis {args.axis} (na={args.na}, nb={args.nb}, nk={args.nk})...")
     X, y = build_arx_matrices(dfs, axis=args.axis, na=args.na, nb=args.nb, nk=args.nk)

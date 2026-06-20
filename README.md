@@ -9,6 +9,7 @@ This repository contains a Python-based system identification and model-based co
 - `id_pipeline.py`: Runs ARX (Autoregressive with Exogenous Input) system identification on flight logs.
 - `analyze_models.py`: Analyzes the identified discrete-time models (poles, zeros, stability, DC gain, and Bode plots).
 - `design_controller.py`: Designs and simulates discrete-time PID controllers by optimizing tracking error (ITAE) and control effort.
+- `run_pipeline.py`: Master automation script that executes identification, analysis, and control design sequentially in one command.
 - `raw_logs/`: Directory containing raw `.BBL` binary log files.
 - `out/`: Contains the generated outputs:
   - `arx_model_axis{0,1,2}.pkl`: Saved model coefficients.
@@ -22,15 +23,26 @@ This repository contains a Python-based system identification and model-based co
 ## Getting Started
 
 ### 1. Setup Environment
-Initialize a virtual environment and install the required dependencies (NumPy, SciPy, Pandas, Matplotlib, Scikit-learn):
+Initialize a virtual environment and install the required dependencies:
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\pip.exe install -r requirements.txt
 ```
 
-### 2. Run System Identification
-Run the identification pipeline for each axis (0 = Roll, 1 = Pitch, 2 = Yaw). We recommend using **1st-order models** (`--na 1 --nb 1`) which capture 98.5%+ of rate variance while avoiding high-frequency overfitting and collinearity:
+### 2. Run the Entire Pipeline (Recommended)
+You can run the entire identification and design process for all three axes with a single command:
+
+```powershell
+.venv\Scripts\python.exe run_pipeline.py
+```
+
+### 3. Running Steps Individually (Optional)
+
+If you prefer to run steps manually or tweak model order parameters:
+
+#### A. Run System Identification
+Run the identification pipeline for each axis (0 = Roll, 1 = Pitch, 2 = Yaw):
 
 ```powershell
 # Roll (Axis 0)
@@ -43,14 +55,14 @@ Run the identification pipeline for each axis (0 = Roll, 1 = Pitch, 2 = Yaw). We
 .venv\Scripts\python.exe id_pipeline.py --axis 2 --na 1 --nb 1 --nk 2
 ```
 
-### 3. Analyze Plant Models
+#### B. Analyze Plant Models
 Run the analysis script to inspect poles/zeros, DC gains, stability, and generate Bode frequency response plots for the identified systems:
 
 ```powershell
 .venv\Scripts\python.exe analyze_models.py
 ```
 
-### 4. Design and Optimize Controller
+#### C. Design and Optimize Controller
 Run the design script to optimize discrete-time PID controllers. It uses a constrained optimization routine (`scipy.optimize.minimize`) to search for the best gains under the ITAE (Integral of Time-weighted Absolute Error) metric and simulates the closed-loop step response:
 
 ```powershell
