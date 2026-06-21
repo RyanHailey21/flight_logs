@@ -1,64 +1,110 @@
 #!/usr/bin/env python3
+"""Model-based PID controller design and closed-loop step response simulation for barometer altitude control."""
 import pickle
+from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd
-from pathlib import Path
 from scipy.optimize import minimize
-from id_pipeline import ConstrainedModel, get_sampling_time
+from id_pipeline import ConstrainedModel
 
-def simulate_closed_loop(a, b, nk, Ts, Kp, Ki, Kd, sign_gain, N_steps=150):
-    """Simulate closed-loop step response of the identified plant with PID control."""
+
+def simulate_closed_loop_altitude_cascaded(a, b, nk, Ts, HOLD_KP, HOLD_KD, HOLD_KI, u_hover, intercept, N_steps=300):
+    """Simulates closed-loop altitude step response using the flight controller's exact cascaded structure."""
+    # Control configuration parameters matching ESP32 firmware
+    ALT_RAMP_RATE_MPS = 3.5     # Reference altitude ramp limit (m/s)
+    NEAR_TARGET_M = 0.5         # Near-target zone (meters)
+    NEAR_TARGET_FACTOR = 0.5    # Cushioning scaling factor
+    MAX_CLIMB_MPS_HOLD = 3.5    # Maximum climb speed limit (m/s)
+    MAX_DESCENT_MPS_HOLD = 1.0  # Maximum descent speed limit (m/s)
+    THR_DOWN_OFFSET_US = 250.0  # Maximum allowable decrease from hover throttle
+    THR_UP_OFFSET_US = 350.0    # Maximum allowable increase from hover throttle
+    KI_VSPEED_LIMIT = 10.0      # Inner integral saturation limit
+    
     r = np.zeros(N_steps)
-    r[10:] = 1.0  # Step input at t=10
+    r[20:] = 18.3  # Setpoint step of 18.3 meters at t = 2.0 seconds
     
     y = np.zeros(N_steps)
     u = np.zeros(N_steps)
     e = np.zeros(N_steps)
     
-    I_acc = 0.0
+    # Initialize past command history to hover throttle
+    u[:] = u_hover
+    
+    vspeedIntegral = 0.0
+    internalSetpoint = 0.0  # Bumpless start from current altitude (0.0 m)
+    
     na = len(a)
     nb = len(b)
     
-    for t in range(1, N_steps):
-        # Error based on feedback
-        e[t] = r[t] - y[t-1]
+    for t in range(2, N_steps):
+        dt = Ts
         
-        # PID control law
-        P_term = Kp * e[t]
-        I_acc += Ki * Ts * e[t]
-        # Anti-windup (limit I-term contribution)
-        I_acc = np.clip(I_acc, -10.0, 10.0)
+        # Current and previous altitude in meters (natively in meters)
+        altitude_m = y[t-1]
+        altitude_last_m = y[t-2]
         
-        # Derivative on measurement (gyro rate y) to prevent derivative kick
-        if t >= 2:
-            D_term = - Kd * (y[t-1] - y[t-2]) / Ts
-        else:
-            D_term = 0.0
+        # 1. Reference shaping: ramp internal setpoint toward target altitude
+        target_m = r[t]
+        if internalSetpoint < target_m:
+            internalSetpoint = min(internalSetpoint + ALT_RAMP_RATE_MPS * dt, target_m)
+        elif internalSetpoint > target_m:
+            internalSetpoint = max(internalSetpoint - ALT_RAMP_RATE_MPS * dt, target_m)
+            
+        # 2. Outer loop: altitude error -> desired vertical speed
+        altError = internalSetpoint - altitude_m
+        e[t] = altError  # Error in meters for cost evaluation
         
-        u_raw = P_term + I_acc + D_term
-        u[t] = sign_gain * u_raw
+        maxClimb = MAX_CLIMB_MPS_HOLD
+        maxDesc = MAX_DESCENT_MPS_HOLD
         
-        # Limit control input (actuator saturation)
-        u[t] = np.clip(u[t], -500.0, 500.0)
+        # Near target cushioning
+        if abs(altError) < NEAR_TARGET_M:
+            factor = abs(altError) / NEAR_TARGET_M
+            factor = NEAR_TARGET_FACTOR + (1.0 - NEAR_TARGET_FACTOR) * factor
+            maxClimb *= factor
+            maxDesc *= factor
+            
+        desiredVspeed = np.clip(HOLD_KP * altError, -maxDesc, maxClimb)
         
-        # Plant equation: y(t) = a*y_past + b*u_past
-        y_val = 0.0
+        # 3. filteredVario (vertical velocity measurement)
+        filteredVario = (altitude_m - altitude_last_m) / dt
+        
+        # 4. Inner PI loop with conditional anti-windup
+        vspeedError = desiredVspeed - filteredVario
+        thrMin = u_hover - THR_DOWN_OFFSET_US
+        thrMax = u_hover + THR_UP_OFFSET_US
+        
+        rawThrottle = u_hover + HOLD_KD * vspeedError + HOLD_KI * vspeedIntegral
+        satHigh = (rawThrottle > thrMax) and (vspeedError > 0)
+        satLow = (rawThrottle < thrMin) and (vspeedError < 0)
+        
+        # Only integrate when not saturated in the direction of the error
+        if not satHigh and not satLow:
+            vspeedIntegral += vspeedError * dt
+            vspeedIntegral = np.clip(vspeedIntegral, -KI_VSPEED_LIMIT, KI_VSPEED_LIMIT)
+            
+        finalThrottle = u_hover + HOLD_KD * vspeedError + HOLD_KI * vspeedIntegral
+        u[t] = np.clip(finalThrottle, thrMin, thrMax)
+        
+        # Plant equation (2nd-order ARX): y(t) = a*y_past + b*u_past + intercept
+        # Corrected: use steady-state values (0 for y, u_hover for u) for negative time indices
+        y_val = intercept
         for i in range(1, na + 1):
-            if t - i >= 0:
-                y_val += a[i-1] * y[t - i]
+            val_y = y[t - i] if t - i >= 0 else 0.0
+            y_val += a[i-1] * val_y
         for j in range(1, nb + 1):
-            if t - nk - j >= 0:
-                y_val += b[j-1] * u[t - nk - j]
+            val_u = u[t - nk - j] if t - nk - j >= 0 else u_hover
+            y_val += b[j-1] * val_u
                 
         y[t] = y_val
         
-        # If output diverges, stop and return large values
-        if np.abs(y[t]) > 1e4 or np.isnan(y[t]):
-            y[t:] = 1e4
+        # Handle divergence
+        if np.abs(y[t]) > 1e3 or np.isnan(y[t]):
+            y[t:] = 1e3
             break
             
     return r, y, u, e
+
 
 def design_controller():
     folder = Path(".")
@@ -71,148 +117,149 @@ def design_controller():
     plots_dir.mkdir(exist_ok=True)
     reports_dir.mkdir(exist_ok=True)
     
-    Ts = get_sampling_time(folder)
-    print(f"Sampling time: {Ts:.6f} s ({1/Ts:.1f} Hz)")
+    model_path = models_dir / "arx_model_altitude.pkl"
+    if not model_path.exists():
+        print(f"Altitude model not found at {model_path}. Exiting.")
+        return
+        
+    with open(model_path, "rb") as f:
+        data = pickle.load(f)
+        
+    model = data["model"]
+    na = data["na"]
+    nb = data["nb"]
+    nk = data["nk"]
+    Ts = data["Ts_down"]  # ~0.1 s
+    coef = model.coef_
+    intercept = model.intercept_
     
-    axes_names = {0: "Roll", 1: "Pitch", 2: "Yaw"}
+    a = coef[:na]
+    b = coef[na:]
     
-    # Baseline gains estimated from flight logs
-    # Roll: Kp = 1.44, Kd = 0.0024
-    # Pitch: Kp = 1.50, Kd = 0.0069
-    # Yaw: Kp = 1.43, Kd = 0
-    # Let's set Ki based on typical Betaflight I/P ratios (around 1.7)
-    baseline_gains = {
-        0: {"Kp": 1.44, "Ki": 1.44 * 1.7, "Kd": 0.0024},
-        1: {"Kp": 1.50, "Ki": 1.50 * 1.7, "Kd": 0.0069},
-        2: {"Kp": 1.43, "Ki": 1.43 * 1.7, "Kd": 0.0}
-    }
+    # Calculate hover throttle bias
+    sum_b = np.sum(b)
+    if np.abs(sum_b) > 1e-6:
+        u_hover = -intercept / sum_b
+    else:
+        u_hover = 1350.0
+    u_hover = np.clip(u_hover, 1100.0, 1600.0)
     
-    controller_report = []
-    controller_report.append("# Model-Based Controller Design and Tuning Report\n")
+    print(f"\nDesigning Cascaded PID controller for Altitude...")
+    print(f"  Calculated Steady-State Hover Throttle: {u_hover:.1f}")
     
-    for axis in [0, 1, 2]:
-        model_path = models_dir / f"arx_model_axis{axis}.pkl"
-        if not model_path.exists():
-            continue
+    # Cost function to minimize
+    def cost_func(params):
+        HOLD_KP, HOLD_KD, HOLD_KI = params
+        r, y, u, e = simulate_closed_loop_altitude_cascaded(a, b, nk, Ts, HOLD_KP, HOLD_KD, HOLD_KI, u_hover, intercept)
+        
+        if np.any(np.abs(y) >= 1e3):
+            return 1e9
             
-        with open(model_path, "rb") as f:
-            data = pickle.load(f)
+        # ITAE: Integral of Time-weighted Absolute Error (scaled by 100 to match cm landscape)
+        itae = 0.0
+        for t in range(20, len(y)):
+            time_val = (t - 20) * Ts
+            itae += time_val * np.abs(r[t] - y[t]) * 100.0
             
-        model = data["model"]
-        na = data["na"]
-        nb = data["nb"]
-        nk = data["nk"]
-        coef = model.coef_
+        # Overshoot penalty (target setpoint is 18.3 m, tolerate up to 10% or 1.83 m)
+        overshoot = np.max(y) - 18.3
+        overshoot_penalty = 1000.0 * ((overshoot * 100.0) ** 2) if overshoot > 1.83 else 0.0
         
-        a = coef[:na]
-        b = coef[na:]
+        # Control effort penalty (changes in throttle command to prevent twitching)
+        du = np.diff(u)
+        effort_penalty = 0.1 * np.sum(du ** 2)
         
-        # Calculate sign of DC gain to ensure negative feedback
-        sum_b = np.sum(b)
-        sum_a = np.sum(a)
-        dc_gain = sum_b / (1.0 - sum_a)
-        sign_gain = np.sign(dc_gain)
+        # Steady-state error penalty (scaled to cm)
+        sse_penalty = 100.0 * ((np.mean(e[-30:]) * 100.0) ** 2)
         
-        axis_name = axes_names[axis]
-        print(f"\nDesigning PID controller for Axis {axis} ({axis_name})...")
+        return itae + overshoot_penalty + effort_penalty + sse_penalty
         
-        # Cost function to minimize
-        def cost_func(params):
-            Kp, Ki, Kd = params
-            r, y, u, e = simulate_closed_loop(a, b, nk, Ts, Kp, Ki, Kd, sign_gain)
-            
-            # If system diverged, return huge cost
-            if np.any(np.abs(y) >= 1e3):
-                return 1e9
-                
-            # ITAE: Integral of Time-weighted Absolute Error (skip first 10 steps before step)
-            itae = 0.0
-            for t in range(10, len(y)):
-                time_val = (t - 10) * Ts
-                itae += time_val * np.abs(r[t] - y[t])
-                
-            # Overshoot penalty
-            overshoot = np.max(y) - 1.0
-            overshoot_penalty = 1000.0 * (overshoot ** 2) if overshoot > 0.05 else 0.0
-            
-            # Control effort penalty (smoothness)
-            du = np.diff(u)
-            effort_penalty = 0.02 * np.sum(du ** 2)
-            
-            # Steady state error penalty
-            sse_penalty = 100.0 * (np.mean(e[-20:]) ** 2)
-            
-            return itae + overshoot_penalty + effort_penalty + sse_penalty
-            
-        # Initial guess: [Kp, Ki, Kd]
-        p_base = baseline_gains[axis]
-        x0 = [p_base["Kp"], p_base["Ki"], p_base["Kd"]]
-        
-        # Bounds: Kp > 0, Ki >= 0, Kd >= 0 (and Kd=0 for Yaw)
-        if axis == 2:
-            bounds = [(0.1, 10.0), (0.0, 50.0), (0.0, 0.0)] # No D-term on Yaw
-        else:
-            bounds = [(0.1, 10.0), (0.0, 50.0), (0.0, 0.1)]
-            
-        res = minimize(cost_func, x0, bounds=bounds, method="L-BFGS-B")
-        
-        Kp_opt, Ki_opt, Kd_opt = res.x
-        print(f"  Optimized PID Gains: Kp={Kp_opt:.4f}, Ki={Ki_opt:.4f}, Kd={Kd_opt:.6f}")
-        print(f"  Baseline PID Gains:  Kp={p_base['Kp']:.4f}, Ki={p_base['Ki']:.4f}, Kd={p_base['Kd']:.6f}")
-        
-        # Simulate both controllers
-        r, y_opt, u_opt, e_opt = simulate_closed_loop(a, b, nk, Ts, Kp_opt, Ki_opt, Kd_opt, sign_gain)
-        _, y_base, u_base, e_base = simulate_closed_loop(a, b, nk, Ts, p_base["Kp"], p_base["Ki"], p_base["Kd"], sign_gain)
-        
-        # Plot and save step response comparison
-        t_arr = np.arange(len(r)) * Ts * 1000 # in ms
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
-        
-        ax1.plot(t_arr, r, 'k--', label="Setpoint", alpha=0.7)
-        ax1.plot(t_arr, y_base, 'r-', label="Baseline (Flight Logs)", lw=1.5)
-        ax1.plot(t_arr, y_opt, 'b-', label="Optimized PID", lw=2)
-        ax1.set_ylabel("Gyro Rate (Normalized)")
-        ax1.set_title(f"Closed-Loop Step Response Comparison - {axis_name} Axis")
-        ax1.grid(True, linestyle=':', alpha=0.5)
-        ax1.legend()
-        
-        ax2.plot(t_arr, u_base, 'r-', label="Baseline Actuation", alpha=0.7)
-        ax2.plot(t_arr, u_opt, 'b-', label="Optimized Actuation", alpha=0.9)
-        ax2.set_xlabel("Time (ms)")
-        ax2.set_ylabel("Control Signal (PID Sum)")
-        ax2.grid(True, linestyle=':', alpha=0.5)
-        ax2.legend()
-        
-        plt.tight_layout()
-        plot_path = plots_dir / f"control_design_axis{axis}.png"
-        plt.savefig(plot_path)
-        plt.close()
-        
-        print(f"  Saved comparison plot to {plot_path}")
-        
-        # Markdown report entry
-        report_section = f"""## Axis {axis}: {axis_name}
-
-| Controller | $K_p$ | $K_i$ | $K_d$ | Features |
-|---|---|---|---|---|
-| **Baseline (Flight Logs)** | {p_base["Kp"]:.4f} | {p_base["Ki"]:.4f} | {p_base["Kd"]:.6f} | Stable, tuned during test flight |
-| **Optimized PID (Model-Based)** | {Kp_opt:.4f} | {Ki_opt:.4f} | {Kd_opt:.6f} | Minimizes ITAE error & actuator rates |
-
-### Step Response Simulation
-![Closed-loop response comparison](file:///{plot_path.resolve().as_posix()})
-
-### Key Design Notes
-- **Feedback Sign**: The plant DC gain is {dc_gain:.6f}. A **{"negative" if dc_gain < 0 else "positive"}** feedback sign correction has been applied to the control loop.
-- **Actuator Activity**: The optimized gains result in **{"smoother" if np.sum(np.diff(u_opt)**2) < np.sum(np.diff(u_base)**2) else "more aggressive"}** actuator commands compared to the baseline flight logs, balancing response speed and motor heating.
-"""
-        controller_report.append(report_section)
-        
+    # Baseline gains for comparison
+    p_base = {"HOLD_KP": 1.0, "HOLD_KD": 120.0, "HOLD_KI": 15.0}
+    x0 = [p_base["HOLD_KP"], p_base["HOLD_KD"], p_base["HOLD_KI"]]
+    
+    # Optimization Bounds (Safe flight envelope to prevent noise amplification):
+    # KP (0.1 -> 3.0), KD (10.0 -> 200.0), KI (0.0 -> 40.0)
+    bounds = [(0.1, 3.0), (10.0, 200.0), (0.0, 40.0)]
+    
+    res = minimize(cost_func, x0, bounds=bounds, method="L-BFGS-B")
+    HOLD_KP_opt, HOLD_KD_opt, HOLD_KI_opt = res.x
+    
+    print(f"  Optimized Cascaded Gains: HOLD_KP={HOLD_KP_opt:.4f}, HOLD_KD={HOLD_KD_opt:.4f}, HOLD_KI={HOLD_KI_opt:.4f}")
+    print(f"  Baseline Cascaded Gains:  HOLD_KP={p_base['HOLD_KP']:.4f}, HOLD_KD={p_base['HOLD_KD']:.4f}, HOLD_KI={p_base['HOLD_KI']:.4f}")
+    
+    # Simulate both controllers
+    r, y_opt, u_opt, e_opt = simulate_closed_loop_altitude_cascaded(a, b, nk, Ts, HOLD_KP_opt, HOLD_KD_opt, HOLD_KI_opt, u_hover, intercept)
+    _, y_base, u_base, e_base = simulate_closed_loop_altitude_cascaded(a, b, nk, Ts, p_base["HOLD_KP"], p_base["HOLD_KD"], p_base["HOLD_KI"], u_hover, intercept)
+    
+    # Plot results
+    t_arr = np.arange(len(r)) * Ts  # in seconds
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    
+    ax1.plot(t_arr, r, 'k--', label="Setpoint", alpha=0.7)
+    ax1.plot(t_arr, y_base, 'r-', label="Baseline Controller", lw=1.5)
+    ax1.plot(t_arr, y_opt, 'b-', label="Optimized Cascaded PID", lw=2)
+    ax1.set_ylabel("Altitude (m)")
+    ax1.set_title("Closed-Loop Altitude Step Response (Cascaded Loop)")
+    ax1.grid(True, linestyle=':', alpha=0.5)
+    ax1.legend()
+    
+    ax2.plot(t_arr, u_base, 'r-', label="Baseline Throttle", alpha=0.7)
+    ax2.plot(t_arr, u_opt, 'b-', label="Optimized Throttle", alpha=0.9)
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Throttle command (rcCommand[3])")
+    ax2.grid(True, linestyle=':', alpha=0.5)
+    ax2.legend()
+    
+    plt.tight_layout()
+    plot_path = plots_dir / "control_design_altitude.png"
+    plt.savefig(plot_path)
+    plt.close()
+    
+    print(f"  Saved comparison plot to {plot_path}")
+    
     # Write report
+    report_content = []
+    report_content.append("# Model-Based Altitude Controller Design and Tuning Report\n\n")
+    report_content.append("| Controller | HOLD_KP (Outer P) | HOLD_KD (Inner P) | HOLD_KI (Inner I) | Features |\n")
+    report_content.append("|---|---|---|---|---|\n")
+    report_content.append(f"| **Baseline Controller** | {p_base['HOLD_KP']:.4f} | {p_base['HOLD_KD']:.4f} | {p_base['HOLD_KI']:.4f} | Conservative default gains |\n")
+    report_content.append(f"| **Optimized PID (Model-Based)** | {HOLD_KP_opt:.4f} | {HOLD_KD_opt:.4f} | {HOLD_KI_opt:.4f} | Minimizes ITAE error & overshoot |\n\n")
+    
+    report_content.append("### Step Response Simulation\n")
+    report_content.append(f"![Closed-loop response comparison](../plots/{plot_path.name})\n\n")
+    
+    report_content.append("### Key Design Notes\n")
+    report_content.append(f"- **Calculated Hover Throttle**: {u_hover:.1f}\n")
+    report_content.append(f"- **Structure Matching**: The tuning simulation uses the exact cascaded structure running in the ESP32 firmware (Proportional outer loop on altitude error + Proportional-Integral inner loop on vertical speed error) with saturation clipping and anti-windup.\n")
+    report_content.append(f"- **Gains Interpretation**:\n")
+    report_content.append(f"  - `HOLD_KP` converts altitude error (meters) to target climbing/descending rate (meters/second).\n")
+    report_content.append(f"  - `HOLD_KD` converts vertical speed error (meters/second) to pulse width modulation throttle offset (microseconds).\n")
+    report_content.append(f"  - `HOLD_KI` integrates the speed error (converting to meters) to command throttle bias.\n")
+    
     report_file = reports_dir / "control_design_report.md"
     with open(report_file, "w") as f:
-        f.writelines(controller_report)
-    print(f"\nSaved control design report to {report_file}")
+        f.writelines(report_content)
+    print(f"Saved control design report to {report_file}")
+    
+    # Auto-generate C++ header file for integration
+    header_file = out / "altitude_gains.h"
+    header_content = f"""// Auto-generated by design_controller.py
+// This file contains model-based optimized controller gains.
+#pragma once
+
+namespace AltitudeParameters {{
+    constexpr float HOLD_KP = {HOLD_KP_opt:.6f}f;
+    constexpr float HOLD_KD = {HOLD_KD_opt:.6f}f;
+    constexpr float HOLD_KI = {HOLD_KI_opt:.6f}f;
+    constexpr float HOVER_THROTTLE = {u_hover:.6f}f;
+}}
+"""
+    with open(header_file, "w") as f:
+        f.write(header_content)
+    print(f"Saved C++ header parameters to {header_file}")
+
 
 if __name__ == "__main__":
     design_controller()

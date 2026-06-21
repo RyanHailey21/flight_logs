@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Simple system-identification pipeline for Betaflight Blackbox (.bbl) logs.
+"""System identification pipeline for multirotor barometer altitude control.
 
-Features:
-- Parse CSVs from bbl_parser
-- Calculate PID Sum (input) and Gyro (output) for a specific axis (0=Roll, 1=Pitch, 2=Yaw)
-- Build ARX regressors per-log to prevent boundary crossing
-- Include input latency (nk offset)
-- Fit an ARX linear model
+Identifies a 2nd-order discrete-time transfer function from throttle stick command
+(rcCommand[3]) to barometer altitude (baroAlt) using 10 Hz downsampled log data.
 """
 import argparse
 import pickle
@@ -18,40 +14,134 @@ import pandas as pd
 from scipy.optimize import lsq_linear
 
 
-def load_logs(folder: Path, file_name: str = None):
-    dfs = []
-    csv_dir = folder / "out" / "csv"
-    if not csv_dir.exists():
-        csv_dir = folder / "csv"
-    if not csv_dir.exists():
-        csv_dir = folder
-
-    if file_name:
-        p = Path(file_name)
-        if not p.exists():
-            p = csv_dir / file_name
-        if not p.exists():
-            p = folder / file_name
-        if not p.exists():
-            p = folder / "out" / file_name
-        paths = [p] if p.exists() else []
-    else:
-        csvs = sorted(csv_dir.glob("*.csv"))
-        paths = [p for p in csvs if "headers.csv" not in p.name and p.name != "combined.csv"]
-
-    for p in paths:
+def load_and_downsample_with_cache(p: Path, block_size: int):
+    """Loads and downsamples data, utilizing a fast cache if available."""
+    cache_dir = p.parent.parent / "cache"
+    if not cache_dir.exists() and p.parent.name == "csv":
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    elif not cache_dir.exists():
+        cache_dir = p.parent / "out" / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+    cache_file = cache_dir / f"{p.stem}.npz"
+    csv_mtime = p.stat().st_mtime
+    
+    if cache_file.exists() and cache_file.stat().st_mtime > csv_mtime:
         try:
-            df = pd.read_csv(p, low_memory=False)
-            df.columns = [c.strip() for c in df.columns] # Clean column names
-            df["__source_file"] = p.name
-            dfs.append(df)
-            print(f"Loaded {p.name} ({len(df)} rows)")
-        except Exception as e:
-            print(f"Skipping {p.name}: {e}")
+            data = np.load(cache_file, allow_pickle=True)
+            is_active = bool(data["is_active"])
+            duration = float(data["duration"])
+            max_th = float(data["max_throttle"])
+            gyro_std = [float(v) for v in data["gyro_std"]]
             
-    if not dfs:
-        raise RuntimeError("No readable log CSVs found. Please run a blackbox decoder first.")
-    return dfs
+            if not is_active:
+                return None, {
+                    "is_active": False,
+                    "duration": duration,
+                    "max_throttle": max_th,
+                    "gyro_std": gyro_std
+                }
+            
+            return (data["u"], data["y"], data["t"]), {
+                "is_active": True,
+                "duration": duration,
+                "max_throttle": max_th,
+                "gyro_std": gyro_std
+            }
+        except Exception as e:
+            print(f"  [Cache Error] Failed to read {cache_file.name}: {e}. Re-analyzing raw log.")
+            
+    # If not cached or cache invalid, run analysis
+    try:
+        df = pd.read_csv(p, low_memory=False)
+        df.columns = [c.strip() for c in df.columns]
+        
+        # Calculate duration
+        duration = 0.0
+        if "time (us)" in df.columns:
+            t_vals = pd.to_numeric(df["time (us)"], errors='coerce').dropna().values
+            if len(t_vals) > 1:
+                duration = (t_vals[-1] - t_vals[0]) * 1e-6
+        elif "time" in df.columns:
+            t_vals = pd.to_numeric(df["time"], errors='coerce').dropna().values
+            if len(t_vals) > 1:
+                duration = t_vals[-1] - t_vals[0]
+
+        max_th = 0.0
+        u_col = "rcCommand[3]"
+        if u_col in df.columns:
+            max_th = pd.to_numeric(df[u_col], errors='coerce').max()
+        elif "rcCommand" in df.columns:
+            max_th = pd.to_numeric(df["rcCommand"], errors='coerce').max()
+            
+        gyro_std = [0.0, 0.0, 0.0]
+        for axis in [0, 1, 2]:
+            col = f"gyroADC[{axis}]"
+            if col in df.columns:
+                gyro_std[axis] = float(pd.to_numeric(df[col], errors='coerce').std())
+                
+        is_active = (max_th >= 1300.0) and (duration >= 15.0) and (max(gyro_std[0], gyro_std[1]) > 5.0)
+        
+        if not is_active:
+            # Cache inactive status
+            np.savez(
+                cache_file,
+                is_active=False,
+                duration=duration,
+                max_throttle=max_th,
+                gyro_std=gyro_std,
+                u=np.array([]),
+                y=np.array([]),
+                t=np.array([])
+            )
+            return None, {
+                "is_active": False,
+                "duration": duration,
+                "max_throttle": max_th,
+                "gyro_std": gyro_std
+            }
+            
+        downsampled = downsample_data(df, block_size)
+        if downsampled is None:
+            np.savez(
+                cache_file,
+                is_active=False,
+                duration=duration,
+                max_throttle=max_th,
+                gyro_std=gyro_std,
+                u=np.array([]),
+                y=np.array([]),
+                t=np.array([])
+            )
+            return None, {
+                "is_active": False,
+                "duration": duration,
+                "max_throttle": max_th,
+                "gyro_std": gyro_std
+            }
+            
+        u_down, y_down, t_down = downsampled
+        
+        # Cache active data
+        np.savez(
+            cache_file,
+            is_active=True,
+            duration=duration,
+            max_throttle=max_th,
+            gyro_std=gyro_std,
+            u=u_down,
+            y=y_down,
+            t=t_down
+        )
+        return (u_down, y_down, t_down), {
+            "is_active": True,
+            "duration": duration,
+            "max_throttle": max_th,
+            "gyro_std": gyro_std
+        }
+    except Exception as e:
+        print(f"Error parsing log {p.name}: {e}")
+        return None, None
 
 
 def get_sampling_time(folder: Path, verbose: bool = True):
@@ -67,7 +157,6 @@ def get_sampling_time(folder: Path, verbose: bool = True):
     
     for p in csvs:
         try:
-            # Read first 1000 rows
             df = pd.read_csv(p, nrows=1000)
             df.columns = [c.strip() for c in df.columns]
             if "time (us)" in df.columns:
@@ -79,10 +168,9 @@ def get_sampling_time(folder: Path, verbose: bool = True):
 
             if time_col is not None:
                 time_diffs = np.diff(pd.to_numeric(df[time_col], errors='coerce').dropna().values)
-                # Filter out negative differences or zero differences
                 time_diffs = time_diffs[time_diffs > 0]
                 if len(time_diffs) > 0:
-                    Ts = np.mean(time_diffs) * 1e-6 # convert us to seconds
+                    Ts = np.mean(time_diffs) * 1e-6
                     if verbose:
                         print(f"Estimated Ts from {p.name}: {Ts:.6f} s ({1/Ts:.2f} Hz)")
                     return Ts
@@ -90,54 +178,97 @@ def get_sampling_time(folder: Path, verbose: bool = True):
             if verbose:
                 print(f"Could not read time from {p.name}: {e}")
             
-    default_Ts = 0.00025  # 4 kHz default
+    default_Ts = 0.001  # 1 kHz default
     if verbose:
         print(f"Using default Ts: {default_Ts:.6f} s ({1/default_Ts:.2f} Hz)")
     return default_Ts
 
-def build_arx_matrices(dfs, axis, na=2, nb=2, nk=0):
-    # u = PID sum = P + I + D + F
-    # y = Gyro
+
+def downsample_data(df, block_size):
+    """Downsamples high-rate telemetry data to 10 Hz to match barometer update rate, focusing on the in-air segment."""
+    y_col = "baroAlt"
+    u_col = "rcCommand[3]"
     
-    y_col = f"gyroADC[{axis}]"
-    p_col = f"axisP[{axis}]"
-    i_col = f"axisI[{axis}]"
-    d_col = f"axisD[{axis}]"
-    f_col = f"axisF[{axis}]"
+    if y_col not in df.columns or u_col not in df.columns:
+        return None
+        
+    # 1. Filter to only include in-air flight segment (altitude has risen at least 50 cm above takeoff baseline)
+    y_raw_full = pd.to_numeric(df[y_col], errors='coerce').ffill().bfill().values
+    if len(y_raw_full) == 0:
+        return None
+    takeoff_base = y_raw_full[0]
+    takeoff_idx = np.where(y_raw_full > takeoff_base + 50.0)[0]
+    if len(takeoff_idx) == 0:
+        return None
+    start_idx = takeoff_idx[0]
     
+    df_flight = df.iloc[start_idx:].copy()
+    
+    # 2. Extract values for the flight segment
+    y_raw = pd.to_numeric(df_flight[y_col], errors='coerce').ffill().bfill().values
+    u_raw = pd.to_numeric(df_flight[u_col], errors='coerce').ffill().bfill().values
+    t_raw = pd.to_numeric(df_flight["time (us)"], errors='coerce').values * 1e-6
+    
+    # Normalize altitude: subtract initial takeoff altitude offset and convert to meters
+    if len(y_raw) > 0:
+        y_raw = (y_raw - y_raw[0]) / 100.0
+        
+    N = len(df_flight)
+    N_down = N // block_size
+    
+    y_down = []
+    u_down = []
+    t_down = []
+    
+    for i in range(N_down):
+        start = i * block_size
+        end = start + block_size
+        
+        # Take latest altitude at the end of the block
+        y_down.append(y_raw[end - 1])
+        # Take average throttle command over the block (anti-aliasing)
+        u_down.append(np.mean(u_raw[start:end]))
+        # Take latest timestamp
+        t_down.append(t_raw[end - 1])
+        
+    return np.array(u_down), np.array(y_down), np.array(t_down)
+
+
+def build_altitude_arx_matrices_from_cache(paths, block_size, na=2, nb=2, nk=1, verbose=True):
+    """Loads cached/downsampled data and constructs regressor matrix for altitude system ID."""
+    u_all = []
+    y_all = []
+    
+    for p in paths:
+        res, meta = load_and_downsample_with_cache(p, block_size)
+        if res is None:
+            if meta and verbose:
+                print(f"Skipping {p.name} (Non-Flight/Short Test: duration={meta['duration']:.1f}s, max throttle={meta['max_throttle']:.0f}, gyro std=[{meta['gyro_std'][0]:.1f}, {meta['gyro_std'][1]:.1f}])")
+            continue
+            
+        u, y, _ = res
+        u_all.append(u)
+        y_all.append(y)
+        if verbose:
+            print(f"Loaded {p.name} (Cached: {len(u)} samples)")
+            
+    if not u_all:
+        return np.array([]), np.array([])
+        
     Xs = []
     ys = []
     
-    for df in dfs:
-        # Require essential columns (y, P, I, F are essential; D might be missing on yaw)
-        essential_cols = [y_col, p_col, i_col, f_col]
-        if not all(c in df.columns for c in essential_cols):
-            print(f"Missing essential columns in {df['__source_file'].iloc[0]}, skipping.")
-            continue
-            
-        y = pd.to_numeric(df[y_col], errors='coerce').fillna(0).values
-        
-        p_val = pd.to_numeric(df[p_col], errors='coerce').fillna(0).values
-        i_val = pd.to_numeric(df[i_col], errors='coerce').fillna(0).values
-        f_val = pd.to_numeric(df[f_col], errors='coerce').fillna(0).values
-        
-        if d_col in df.columns:
-            d_val = pd.to_numeric(df[d_col], errors='coerce').fillna(0).values
-        else:
-            d_val = np.zeros_like(y)
-            
-        u = p_val + i_val + d_val + f_val
-        
+    for u, y in zip(u_all, y_all):
         N = len(y)
         for t in range(max(na, nb + nk), N):
             row = []
-            # past outputs y(t-1) ... y(t-na)
+            # Past outputs: y(t-1) ... y(t-na)
             for i in range(1, na + 1):
                 row.append(y[t - i])
-            # past inputs u(t-nk-1) ... u(t-nk-nb)
+            # Past inputs: u(t-nk-1) ... u(t-nk-nb)
             for j in range(1, nb + 1):
                 row.append(u[t - nk - j])
-            
+                
             if np.isfinite(row).all() and np.isfinite(y[t]):
                 Xs.append(row)
                 ys.append(y[t])
@@ -153,9 +284,8 @@ class ConstrainedModel:
         return X @ self.coef_ + self.intercept_
 
 
-
 def compile_manifest(folder: Path):
-    """Scan the csv subfolder and compile metadata about all flight logs."""
+    """Scan the csv subfolder and compile metadata about all flight logs utilizing cache for speed."""
     csv_dir = folder / "out" / "csv"
     if not csv_dir.exists():
         csv_dir = folder / "csv"
@@ -166,48 +296,28 @@ def compile_manifest(folder: Path):
     csvs = sorted(csv_dir.glob("*.csv"))
     csvs = [p for p in csvs if "headers.csv" not in p.name and p.name != "combined.csv"]
     
+    # We need block_size to call cache function
+    Ts_raw = get_sampling_time(folder, verbose=False)
+    block_size = int(round(0.1 / Ts_raw))
+    
     records = []
     print(f"Compiling manifest for {len(csvs)} logs...")
     
     for p in csvs:
         try:
-            df = pd.read_csv(p)
-            df.columns = [c.strip() for c in df.columns]
-            
-            rows = len(df)
-            duration = 0.0
-            if "time (us)" in df.columns:
-                t_vals = pd.to_numeric(df["time (us)"], errors='coerce').dropna().values
-                if len(t_vals) > 1:
-                    duration = (t_vals[-1] - t_vals[0]) * 1e-6
-            elif "time" in df.columns:
-                t_vals = pd.to_numeric(df["time"], errors='coerce').dropna().values
-                if len(t_vals) > 1:
-                    duration = t_vals[-1] - t_vals[0]
-                    
-            max_th = 0.0
-            if "rcCommand[3]" in df.columns:
-                max_th = float(pd.to_numeric(df["rcCommand[3]"], errors='coerce').max())
-            elif "rcCommand" in df.columns:
-                max_th = float(pd.to_numeric(df["rcCommand"], errors='coerce').max())
+            _, meta = load_and_downsample_with_cache(p, block_size)
+            if meta is None:
+                continue
                 
-            gyro_std = [0.0, 0.0, 0.0]
-            for axis in [0, 1, 2]:
-                col = f"gyroADC[{axis}]"
-                if col in df.columns:
-                    gyro_std[axis] = float(pd.to_numeric(df[col], errors='coerce').std())
-                    
-            is_active = (max_th > 1180) and (max(gyro_std[0], gyro_std[1]) > 5.0)
-            flight_type = "Active Flight" if is_active else "Bench Test"
+            flight_type = "Active Flight" if meta["is_active"] else "Bench Test"
             
             records.append({
                 "filename": p.name,
-                "samples": rows,
-                "duration_sec": round(duration, 2),
-                "max_throttle": round(max_th, 1),
-                "gyro_std_roll": round(gyro_std[0], 2),
-                "gyro_std_pitch": round(gyro_std[1], 2),
-                "gyro_std_yaw": round(gyro_std[2], 2),
+                "duration_sec": round(meta["duration"], 2),
+                "max_throttle": round(meta["max_throttle"], 1),
+                "gyro_std_roll": round(meta["gyro_std"][0], 2),
+                "gyro_std_pitch": round(meta["gyro_std"][1], 2),
+                "gyro_std_yaw": round(meta["gyro_std"][2], 2),
                 "flight_type": flight_type
             })
         except Exception as e:
@@ -235,10 +345,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--folder", default=".", help="Folder with .csv logs")
     ap.add_argument("--file", default=None, help="Specific CSV file to load")
-    ap.add_argument("--axis", type=int, default=0, help="0=Roll, 1=Pitch, 2=Yaw")
-    ap.add_argument("--na", type=int, default=4, help="Output lag order")
-    ap.add_argument("--nb", type=int, default=4, help="Input lag order")
-    ap.add_argument("--nk", type=int, default=2, help="Input pure delay (latency frames)")
+    ap.add_argument("--na", type=int, default=2, help="Output lag order")
+    ap.add_argument("--nb", type=int, default=2, help="Input lag order")
+    ap.add_argument("--nk", type=int, default=1, help="Input pure delay (latency frames)")
     ap.add_argument("--compile-manifest", action="store_true", help="Compile manifest of all CSV logs")
     args = ap.parse_args()
 
@@ -250,23 +359,48 @@ def main():
         compile_manifest(folder)
         return
 
-    dfs = load_logs(folder, args.file)
-    
-    print(f"Building regressors for Axis {args.axis} (na={args.na}, nb={args.nb}, nk={args.nk})...")
-    X, y = build_arx_matrices(dfs, axis=args.axis, na=args.na, nb=args.nb, nk=args.nk)
+    Ts_raw = get_sampling_time(folder, verbose=False)
+    block_size = int(round(0.1 / Ts_raw))
+    print(f"Loop sampling rate: {1/Ts_raw:.1f} Hz. Downsampling block size: {block_size} (Target: 10 Hz)")
+
+    # Get paths to analyze
+    csv_dir = folder / "out" / "csv"
+    if not csv_dir.exists():
+        csv_dir = folder / "csv"
+    if not csv_dir.exists():
+        csv_dir = folder
+
+    if args.file:
+        p = Path(args.file)
+        if not p.exists():
+            p = csv_dir / args.file
+        if not p.exists():
+            p = folder / args.file
+        if not p.exists():
+            p = folder / "out" / args.file
+        paths = [p] if p.exists() else []
+    else:
+        csvs = sorted(csv_dir.glob("*.csv"))
+        paths = [p for p in csvs if "headers.csv" not in p.name and p.name != "combined.csv"]
+
+    print(f"Loading and building regressors for Altitude (na={args.na}, nb={args.nb}, nk={args.nk})...")
+    X, y = build_altitude_arx_matrices_from_cache(paths, block_size, na=args.na, nb=args.nb, nk=args.nk)
     
     if len(y) == 0:
         print("No valid data collected. Check column mappings.")
         return
         
     print(f"Fitting model on {len(y)} samples...")
-    # Fit with constraints: gains b_j must be non-positive (negative feedback direction)
-    # Add column of ones for intercept
+    # Add intercept column
     X_fit = np.column_stack([X, np.ones(len(X))])
     
-    # Bounds: a_i are stable [0.0, 0.995], b_j are strictly negative [-inf, -1e-5], intercept is unconstrained
-    lb = [0.0] * args.na + [-np.inf] * args.nb + [-np.inf]
-    ub = [0.995] * args.na + [-1e-5] * args.nb + [np.inf]
+    # Box bounds to enforce stability and physical parameter behavior:
+    # a_1 in [0.0, 1.99]
+    # a_2 in [-0.99, 0.0]
+    # b_1, b_2 in [0.0, 10.0] (must be positive because increasing throttle increases altitude)
+    # intercept in [-inf, inf]
+    lb = [0.0, -0.99] + [0.0] * args.nb + [-np.inf]
+    ub = [1.99, 0.0] + [10.0] * args.nb + [np.inf]
     
     res = lsq_linear(X_fit, y, bounds=(lb, ub))
     
@@ -281,44 +415,46 @@ def main():
     # Save model
     models_dir = out / "models"
     models_dir.mkdir(exist_ok=True)
-    model_path = models_dir / f"arx_model_axis{args.axis}.pkl"
+    model_path = models_dir / "arx_model_altitude.pkl"
+    
     with open(model_path, "wb") as f:
         pickle.dump({
-            "model": model, 
-            "axis": args.axis, 
-            "na": args.na, 
-            "nb": args.nb, 
-            "nk": args.nk
+            "model": model,
+            "na": args.na,
+            "nb": args.nb,
+            "nk": args.nk,
+            "block_size": block_size,
+            "Ts_raw": Ts_raw,
+            "Ts_down": Ts_raw * block_size
         }, f)
     print(f"Saved model to {model_path}")
 
-    # Plot on an interesting slice
-    plot_len = min(len(y), 1000)
+    # Plot on downsampled data
+    plot_len = min(len(y), 200)
     plt.figure(figsize=(10, 4))
     
-    # Start part way in assuming we want to skip initial transients
-    start = min(1000, len(y) // 2)
-    end = start + plot_len
+    start = 0
+    end = plot_len
     
-    if start >= len(y):
-        start, end = 0, plot_len
-        
     y_slice = y[start:end]
     yhat_slice = model.predict(X[start:end])
     
-    plt.plot(y_slice, label="True Gyro", color="black", linewidth=1.5)
-    plt.plot(yhat_slice, label="Predicted Gyro", color="red", linestyle="--", alpha=0.9)
+    plt.plot(y_slice, label="True Altitude", color="black", linewidth=1.5)
+    plt.plot(yhat_slice, label="Predicted Altitude (1-Step Ahead)", color="red", linestyle="--", alpha=0.9)
     plt.legend()
-    plt.title(f"Plant ARX Fit (Axis {args.axis})")
-    plt.xlabel("Samples")
-    plt.ylabel("Gyro Rate")
+    plt.title("Altitude ARX Fit (Downsampled to 10 Hz)")
+    plt.xlabel("Samples (at 10 Hz)")
+    plt.ylabel("Altitude (m)")
+    plt.grid(True, linestyle=":", alpha=0.5)
     plt.tight_layout()
     
     plots_dir = out / "plots"
     plots_dir.mkdir(exist_ok=True)
-    figpath = plots_dir / f"fit_axis{args.axis}.png"
+    figpath = plots_dir / "fit_altitude.png"
     plt.savefig(figpath)
+    plt.close()
     print(f"Saved fit plot to {figpath}")
+
 
 if __name__ == '__main__':
     main()

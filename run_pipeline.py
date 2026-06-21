@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Master pipeline execution script for multirotor system ID and control design.
+"""Master pipeline execution script for multirotor barometer altitude control.
 
 Runs:
-1. System Identification (Axes 0, 1, and 2 as 1st-order models)
+1. Altitude System Identification (2nd-order model fit at 10 Hz)
 2. Model Analysis (Poles, stability, DC gain, and Bode plots)
 3. Controller Design (ITAE PID optimization and step response simulation)
+4. Log Manifest compilation
 """
 import subprocess
 import sys
 from pathlib import Path
-
 import argparse
 
 def main():
@@ -25,25 +25,23 @@ def main():
         (out / sub).mkdir(parents=True, exist_ok=True)
     
     print("=================================================================")
-    print("   Multirotor System ID and Control Design Master Pipeline       ")
+    print("   Multirotor Barometer Altitude Control Master Pipeline        ")
     print("=================================================================\n")
     
     # Step 1: System Identification
-    print("--- STEP 1: Running System Identification for Roll, Pitch, and Yaw ---")
-    for axis in [0, 1, 2]:
-        axis_name = {0: "Roll", 1: "Pitch", 2: "Yaw"}[axis]
-        print(f"Fitting 1st-order model for Axis {axis} ({axis_name})...")
+    print("--- STEP 1: Running System Identification for Altitude ---")
+    print("Fitting 2nd-order altitude model...")
+    
+    cmd = [python_bin, "id_pipeline.py"]
+    if args.file:
+        cmd += ["--file", args.file]
         
-        cmd = [python_bin, "id_pipeline.py", "--axis", str(axis), "--na", "1", "--nb", "1", "--nk", "2"]
-        if args.file:
-            cmd += ["--file", args.file]
-            
-        try:
-            subprocess.run(cmd, check=True)
-            print(f"  Axis {axis_name} Model Fit Complete.\n")
-        except subprocess.CalledProcessError as e:
-            print(f"[Error] Error during System ID for Axis {axis_name}: {e}")
-            sys.exit(1)
+    try:
+        subprocess.run(cmd, check=True)
+        print("  Altitude Model Fit Complete.\n")
+    except subprocess.CalledProcessError as e:
+        print(f"[Error] Error during Altitude System ID: {e}")
+        sys.exit(1)
             
     # Step 2: Model Analysis
     print("--- STEP 2: Running Frequency-Domain and Stability Analysis ---")
@@ -75,12 +73,13 @@ def main():
     print("=================================================================")
     print("   Pipeline Execution Complete!                                  ")
     print("   Outputs generated in the 'out/' directory:                    ")
-    print("     - ARX Fit Plots: out/plots/fit_axis{0,1,2}.png              ")
-    print("     - Pole-Zero Maps: out/plots/pzmap_axis{0,1,2}.png           ")
-    print("     - Bode Plots: out/plots/bode_axis{0,1,2}.png                ")
-    print("     - Control Design Plots: out/plots/control_design_axis{0,1,2}.png")
+    print("     - ARX Fit Plot: out/plots/fit_altitude.png                  ")
+    print("     - Pole-Zero Map: out/plots/pzmap_altitude.png               ")
+    print("     - Bode Plot: out/plots/bode_altitude.png                    ")
+    print("     - Control Design Plot: out/plots/control_design_altitude.png")
     print("     - Reports: out/reports/model_analysis_report.md, out/reports/control_design_report.md")
     print("     - Log Manifests: out/log_manifest.json, out/log_manifest.csv")
+    print("     - C++ Header Parameters: out/altitude_gains.h               ")
     print("=================================================================")
 
 if __name__ == "__main__":
