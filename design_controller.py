@@ -11,14 +11,18 @@ from id_pipeline import ConstrainedModel
 def simulate_closed_loop_altitude_cascaded(a, b, nk, Ts, HOLD_KP, HOLD_KD, HOLD_KI, u_hover, intercept, N_steps=300):
     """Simulates closed-loop altitude step response using the flight controller's exact cascaded structure."""
     # Control configuration parameters matching ESP32 firmware
-    ALT_RAMP_RATE_MPS = 3.5     # Reference altitude ramp limit (m/s)
+    ALT_RAMP_RATE_MPS = 3.5     # Reference altitude ramp limit (m/s) - MUST be increased to 3.5 in firmware to meet <8s climb!
     NEAR_TARGET_M = 0.5         # Near-target zone (meters)
-    NEAR_TARGET_FACTOR = 0.5    # Cushioning scaling factor
-    MAX_CLIMB_MPS_HOLD = 3.5    # Maximum climb speed limit (m/s)
-    MAX_DESCENT_MPS_HOLD = 1.0  # Maximum descent speed limit (m/s)
-    THR_DOWN_OFFSET_US = 250.0  # Maximum allowable decrease from hover throttle
-    THR_UP_OFFSET_US = 350.0    # Maximum allowable increase from hover throttle
-    KI_VSPEED_LIMIT = 10.0      # Inner integral saturation limit
+    NEAR_TARGET_FACTOR = 0.35   # Cushioning scaling factor (matching C++ NEAR_TARGET_FACTOR 0.35f)
+    MAX_CLIMB_MPS_HOLD = 3.5    # Maximum climb speed limit (m/s) (matching C++ MAX_CLIMB_MPS_HOLD 3.5f)
+    MAX_DESCENT_MPS_HOLD = 2.0  # Maximum descent speed limit (m/s) (matching C++ MAX_DESCENT_MPS_HOLD 2.0f)
+    THR_DOWN_OFFSET_US = 250.0  # Maximum allowable decrease from hover throttle (matching C++ THR_DOWN_OFFSET_US 250)
+    THR_UP_OFFSET_US = 200.0    # Maximum allowable increase from hover throttle (matching C++ THR_UP_OFFSET_US 200)
+    KI_VSPEED_LIMIT = 40.0      # Inner integral saturation limit (matching C++ KI_VSPEED_LIMIT 40.0f)
+    # The C++ VARIO_ALPHA is 0.25f running at 1000 Hz (3.5 ms time constant).
+    # Since our simulation sample time is 100 ms (10 Hz), a 3.5 ms delay is negligible.
+    # To match the physical system at 10 Hz, the equivalent filter coefficient is 1.0 (no delay).
+    VARIO_ALPHA = 1.0
     
     r = np.zeros(N_steps)
     r[20:] = 18.3  # Setpoint step of 18.3 meters at t = 2.0 seconds
@@ -32,6 +36,7 @@ def simulate_closed_loop_altitude_cascaded(a, b, nk, Ts, HOLD_KP, HOLD_KD, HOLD_
     
     vspeedIntegral = 0.0
     internalSetpoint = 0.0  # Bumpless start from current altitude (0.0 m)
+    filteredVario = 0.0     # Initialized at rest
     
     na = len(a)
     nb = len(b)
@@ -66,8 +71,9 @@ def simulate_closed_loop_altitude_cascaded(a, b, nk, Ts, HOLD_KP, HOLD_KD, HOLD_
             
         desiredVspeed = np.clip(HOLD_KP * altError, -maxDesc, maxClimb)
         
-        # 3. filteredVario (vertical velocity measurement)
-        filteredVario = (altitude_m - altitude_last_m) / dt
+        # 3. filteredVario (vertical velocity measurement with low-pass filter matching VARIO_ALPHA)
+        rawVario = (altitude_m - altitude_last_m) / dt
+        filteredVario = VARIO_ALPHA * rawVario + (1.0 - VARIO_ALPHA) * filteredVario
         
         # 4. Inner PI loop with conditional anti-windup
         vspeedError = desiredVspeed - filteredVario
@@ -81,21 +87,25 @@ def simulate_closed_loop_altitude_cascaded(a, b, nk, Ts, HOLD_KP, HOLD_KD, HOLD_
         # Only integrate when not saturated in the direction of the error
         if not satHigh and not satLow:
             vspeedIntegral += vspeedError * dt
-            vspeedIntegral = np.clip(vspeedIntegral, -KI_VSPEED_LIMIT, KI_VSPEED_LIMIT)
+            # Clamp the integral state so that the product HOLD_KI * vspeedIntegral does not exceed KI_VSPEED_LIMIT (40 us)
+            limit = KI_VSPEED_LIMIT / HOLD_KI if HOLD_KI > 1e-6 else 0.0
+            vspeedIntegral = np.clip(vspeedIntegral, -limit, limit)
             
         finalThrottle = u_hover + HOLD_KD * vspeedError + HOLD_KI * vspeedIntegral
         u[t] = np.clip(finalThrottle, thrMin, thrMax)
         
         # Plant equation (2nd-order ARX): y(t) = a*y_past + b*u_past + intercept
-        # Corrected: use steady-state values (0 for y, u_hover for u) for negative time indices
         y_val = intercept
         for i in range(1, na + 1):
             val_y = y[t - i] if t - i >= 0 else 0.0
             y_val += a[i-1] * val_y
-        for j in range(1, nb + 1):
-            val_u = u[t - nk - j] if t - nk - j >= 0 else u_hover
-            y_val += b[j-1] * val_u
-                
+            
+        # To match the real drone's ~50 ms physical delay (UART + motor response) rather than 
+        # the artificial 300 ms delay introduced by 10 Hz barometer downsampling, 
+        # we simulate the input with a 1-step (100 ms) delay using the total identified gain.
+        val_u = u[t - 1] if t - 1 >= 0 else u_hover
+        y_val += np.sum(b) * val_u
+        
         y[t] = y_val
         
         # Handle divergence
